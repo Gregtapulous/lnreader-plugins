@@ -5,7 +5,7 @@ import { Plugin } from '@/types/plugin';
 import dayjs from 'dayjs';
 
 /**
- * Candidate compatibility update for Scribble Hub after the 2026 redesign.
+ * Candidate diagnostic update for Scribble Hub after the 2026 redesign.
  * Not yet tested against a live Scribble Hub page, which returns HTTP 403
  * to automated inspection. Install only after backing up LNReader.
  *
@@ -16,7 +16,7 @@ class ScribbleHubPlugin implements Plugin.PluginBase {
   name = 'Scribble Hub';
   icon = 'src/en/scribblehub/icon.png';
   site = 'https://www.scribblehub.com/';
-  version = '1.0.3';
+  version = '1.0.4';
 
   private normalizePath(href: string | undefined): string | undefined {
     if (!href || href.startsWith('#') || href.startsWith('javascript:')) return;
@@ -29,13 +29,37 @@ class ScribbleHubPlugin implements Plugin.PluginBase {
     }
   }
 
-  private ensurePage(body: string, context: string): void {
-    // Distinguish blocked fetches from changed HTML selectors, instead of
-    // silently displaying an empty list and making diagnosis impossible.
-    if (/checking your browser|just a moment|cloudflare|cf-challenge|verify you are human/i.test(body) &&
-        !/\/series\/\d+/.test(body) && !/\.toc_w|chp_raw/.test(body)) {
-      throw new Error(`Scribble Hub blocked ${context}; open WebView and complete verification.`);
+  /**
+   * Keep network responses and parser/layout failures distinct. In v1.0.3,
+   * the word "cloudflare" anywhere in an otherwise valid page could trigger
+   * a misleading "complete verification" error.
+   *
+   * A successful WebView login does not guarantee that fetch() uses the same
+   * cookies/session or passes the site's anti-bot checks.
+   */
+  private async readPage(url: string, context: string, init?: Parameters<typeof fetchApi>[1]): Promise<{
+    html: string; status: number; title: string;
+  }> {
+    const response = await fetchApi(url, init);
+    const html = await response.text();
+    const $ = parseHTML(html);
+    const title = $('title').first().text().replace(/\s+/g, ' ').trim().slice(0, 100);
+    const titleDisplay = title || '(no HTML title)';
+    // Only treat recognizable challenge pages as challenges, rather than
+    // finding the word "Cloudflare" somewhere in a normal website script.
+    const challenge = /^(just a moment|attention required|checking your browser|verify you are human)/i.test(title) ||
+      /<form[^>]*id=["']challenge-form["']/i.test(html) ||
+      /<script[^>]+\/cdn-cgi\/challenge-platform\//i.test(html) ||
+      /window\._cf_chl_opt\s*=/i.test(html);
+    if (!response.ok) {
+      throw new Error(`Scribble Hub ${context}: HTTP ${response.status}; page title: "${titleDisplay}". ` +
+        'The website refused the plugin request; WebView authentication may not carry over.');
     }
+    if (challenge) {
+      throw new Error(`Scribble Hub ${context}: challenge page returned (HTTP ${response.status}; ` +
+        `title: "${titleDisplay}"). LNReader's background request is not passing site verification.`);
+    }
+    return { html, status: response.status, title: titleDisplay };
   }
 
   parseNovels($: CheerioAPI): Plugin.NovelItem[] {
@@ -101,10 +125,9 @@ class ScribbleHubPlugin implements Plugin.PluginBase {
     } else {
       url += `series-finder/?sf=1&sort=ratings&order=desc&pg=${page}`;
     }
-    const body = await fetchApi(url).then(result => result.text());
-    this.ensurePage(body, 'browse');
-    const novels = this.parseNovels(parseHTML(body));
-    if (!novels.length && page === 1) throw new Error('Scribble Hub returned no recognizable series links. The site markup may have changed or blocked the request.');
+    const result = await this.readPage(url, 'browse');
+    const novels = this.parseNovels(parseHTML(result.html));
+    if (!novels.length && page === 1) throw new Error(`Scribble Hub browse: HTTP ${result.status}, title: "${result.title}", but no series links matched. Site layout or endpoint likely changed.`);
     return novels;
   }
 
@@ -145,9 +168,8 @@ class ScribbleHubPlugin implements Plugin.PluginBase {
 
   async parseNovel(novelPath: string): Promise<Plugin.SourceNovel> {
     const path = this.normalizePath(novelPath) || novelPath;
-    const body = await fetchApi(this.site + path).then(result => result.text());
-    this.ensurePage(body, 'series details');
-    const $ = parseHTML(body);
+    const page = await this.readPage(this.site + path, 'series details');
+    const $ = parseHTML(page.html);
     const novel: Plugin.SourceNovel = {
       path,
       name: $('.fic_title, .series-title, h1.entry-title, h1').first().text().trim() || 'Untitled',
@@ -172,12 +194,10 @@ class ScribbleHubPlugin implements Plugin.PluginBase {
         formData.append('action', 'wi_getreleases_pagination');
         formData.append('pagenum', '-1');
         formData.append('mypostid', seriesId);
-        const response = await fetchApi(`${this.site}wp-admin/admin-ajax.php`, {
+        const ajax = await this.readPage(`${this.site}wp-admin/admin-ajax.php`, 'chapter list', {
           method: 'POST', body: formData,
         });
-        const text = await response.text();
-        this.ensurePage(text, 'chapter list');
-        chapters = this.parseChapterLinks(parseHTML(text));
+        chapters = this.parseChapterLinks(parseHTML(ajax.html));
       } catch (_error) {
         // Fall back to reading the on-page chapter links.
       }
@@ -190,9 +210,8 @@ class ScribbleHubPlugin implements Plugin.PluginBase {
 
   async parseChapter(chapterPath: string): Promise<string> {
     const path = this.normalizePath(chapterPath) || chapterPath;
-    const body = await fetchApi(this.site + path).then(result => result.text());
-    this.ensurePage(body, 'chapter content');
-    const $ = parseHTML(body);
+    const page = await this.readPage(this.site + path, 'chapter content');
+    const $ = parseHTML(page.html);
     const html = $('div.chp_raw, #chp_raw, .chapter-content, .reading-content, article.chapter').first().html() || '';
     if (!html.trim()) throw new Error('Chapter HTML was empty; Scribble Hub may have changed its reading-page markup.');
     return html;
@@ -200,9 +219,10 @@ class ScribbleHubPlugin implements Plugin.PluginBase {
 
   async searchNovels(searchTerm: string): Promise<Plugin.NovelItem[]> {
     const url = `${this.site}?s=${encodeURIComponent(searchTerm)}&post_type=fictionposts`;
-    const body = await fetchApi(url).then(result => result.text());
-    this.ensurePage(body, 'search');
-    return this.parseNovels(parseHTML(body));
+    const page = await this.readPage(url, 'search');
+    const novels = this.parseNovels(parseHTML(page.html));
+    if (!novels.length) console.log(`Scribble Hub search returned zero results (HTTP ${page.status}, title: ${page.title}).`);
+    return novels;
   }
 
   // Retain original LNReader filters to preserve how the source is browsed.
